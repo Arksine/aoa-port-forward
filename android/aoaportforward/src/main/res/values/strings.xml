@@ -1,3 +1,8 @@
 <resources>
     <string name="app_name">AoaPortForward</string>
+    <string name="service_name">Accessory Port Forward</string>
+    <string name="NOTIFICATION_TEXT">Listening on port </string>
+    <string name="NOTIFICATION_NOT_CONNECTED">Accessory Not Connected</string>
+    <string name="ACTION_STOP_SERVICE">com.arksine.aoaportforward.STOP_SERVICE</string>
+    <string name="ACTION_CONNECT_ACCESSORY">com.arksine.aoaportforward.ACTION_CONNECT_ACCESSORY</string>
 </resources>

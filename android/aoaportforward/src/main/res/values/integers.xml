@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <integer name="ONGOING_NOTIFICATION_ID">9102</integer>
+    <integer name="REQUEST_STOP_SERVICE">9103</integer>
+</resources>
