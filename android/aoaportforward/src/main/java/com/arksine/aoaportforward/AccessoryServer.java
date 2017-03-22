@@ -22,6 +22,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
+// TODO: might be better to use Selectors for socket I/O instead of spawning a new thread
+// for each socket
+
 /**
  *  Connects to the USB Accessory.  After a connections has been established, this class
  *  listens on the provided port for connections.  Connections are then forwarded over USB
@@ -257,6 +260,15 @@ class AccessoryServer {
         }
     }
 
+    private void writeCommand(PortCommand command) {
+        byte[] commandBuf = ByteBuffer.allocate(4)
+                .put(command.getBytes())
+                .putShort((short)4)
+                .array();
+
+        writeToAccessory(commandBuf, 4);
+    }
+
     private void writeCommand(PortCommand command, short data) {
         byte[] commandBuf = ByteBuffer.allocate(6)
                 .put(command.getBytes())
@@ -320,6 +332,7 @@ class AccessoryServer {
         public void onDisconnect(final int socketId) {
             int count = mConnectionCount.decrementAndGet();
             mSocketArray.set(socketId, null);
+            writeCommand(PortCommand.DISCONNECT_SOCKET, (short)socketId);
             mAccessoryCallbacks.onSocketDisconnected(count);
         }
 
@@ -402,7 +415,7 @@ class AccessoryServer {
                     } else {
                         switch (cmd) {
                             case CONNECT_SOCKET:
-                            case DISCONNECT_SOCKET:
+                            case DISCONNECT_SOCKET: // TODO: This could be an error response, need to handle it
                             case ACCESSORY_CONNECTED:
                                 Log.i(TAG, "Should not receive command from server: " + cmd);
                                 break;
@@ -447,7 +460,7 @@ class AccessoryServer {
             // Stop socket threads
             Utils.stopThread(mConnectionListenerThread);
             // send terminate command, stop thread with a longer timeout (1000ms)
-            writeCommand(PortCommand.TERMINATE_ACCESSORY, (short)0);
+            writeCommand(PortCommand.TERMINATE_ACCESSORY);
             Utils.stopThread(mAccessoryReadThread, 1000);
             Utils.closeItem(mAccessoryInputStream);
             Utils.closeItem(mAccessoryOutputStream);
