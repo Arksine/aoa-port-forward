@@ -148,32 +148,28 @@ class AndroidAccessory(object):
 
     def _find_handle(self, vendor_id=None, product_id=None, attempts_left=5):
         handle = None
-        found_pid = None
+        found_dev = None
         for device in self._context.getDeviceList():
             if vendor_id and product_id:
                 # match by vendor and product id
                 if (device.getVendorID() == vendor_id and
                         device.getProductID == product_id):
-                    try:
-                        handle = device.open()
-                        found_vid = vendor_id
-                        found_pid = device.getProductID()
-                    except usb1.USBError as err:
-                        print(err.args)
-                    break
+                    handle = self._open_device(device)
+                    if handle:
+                        found_dev = device
+                        break
             elif device.getVendorID() in COMPATIBLE_VIDS:
                 # attempt to get the first compatible vendor id
-                try:
-                    handle = device.open()
-                    found_vid = device.getVendorID()
-                    found_pid = device.getProductID()
-                except usb1.USBError as err:
-                    print(err.args)
-                break
+                handle = self._open_device(device)
+                if handle:
+                    found_dev = device
+                    break
 
         if handle:
-            print('Found {0:x}:{1:x}'.format(found_vid, found_pid))
-            if found_pid in ACCESSORY_PID:
+            eprint("Device Found: {0}".format(found_dev))
+            eprint("Product: {0}".format(
+                handle.getASCIIStringDescriptor(found_dev.device_descriptor.iProduct)))
+            if found_dev.getProductID() in ACCESSORY_PID:
                 return True, handle
             else:
                 return False, handle
@@ -181,7 +177,20 @@ class AndroidAccessory(object):
             time.sleep(1)
             return self._find_handle(vendor_id, product_id, attempts_left-1)
         else:
-            raise usb1.USBError('Device not connected')
+            raise usb1.USBError('Device not available')
+
+    def _open_device(self, device):
+        eprint("Open attempt: {0}".format(device))
+        eprint("Class: {0:x}, Subclass: {1:x}".format(
+            device.getDeviceClass(), device.getDeviceSubClass()
+        ))
+        try:
+            handle = device.open()
+        except usb1.USBError as err:
+            eprint("Unable to get device handle: %s" % err)
+            return None
+        else:
+            return handle
 
     def _configure_accessory_mode(self):
         # Don't need to claim interface to do control read/write, and the
@@ -204,7 +213,7 @@ class AndroidAccessory(object):
                 52, 0, i, data.encode()
             ) == len(data)
 
-        if adk_ver == 2:
+        if adk_ver == 2 and sys.platform == 'linux':
             # enable 2 channel audio
             assert self._handle.controlWrite(
                 usb1.TYPE_VENDOR | usb1.RECIPIENT_DEVICE,
@@ -244,20 +253,36 @@ class AndroidAccessory(object):
         for data.  If data is found, it is muxed and sent back to the
         android device via usb
         """
+        def _win_select():
+            while len(self._socket_dict) == 0:
+                time.sleep(.001)
+                if not self._is_running:
+                    return []
+            return self._socket_selector.select()
+
+        def _nix_select():
+            return self._socket_selector.select()
+
+        if sys.platform == 'win32':
+            select_func = _win_select
+        else:
+            select_func = _nix_select
+
         buffer = bytearray(8192)
         buff_view = memoryview(buffer)
         buff_view[0:2] = CMD_DATA_PACKET
         while self._is_running:
-            events = self._socket_selector.select()
+            # TODO: On windows I can't do this when no sockets are registered
+            events = select_func()
             for key, event in events:
                 if event & selectors.EVENT_READ:
                     try:
-                        bytesRead = key.fileobj.recv_into(buff_view[6:])
+                        bytes_read = key.fileobj.recv_into(buff_view[6:])
                     except EOFError:
                         # This socket has been closed, disconnect it
                         self.disconnect_socket(key.data)
                         continue
-                    length = bytesRead + 6  # add header to length
+                    length = bytes_read + 6  # add header to length
                     len_bytes = pack('>H', length)
                     id_bytes = pack('>H', key.data)
                     buff_view[2:4] = len_bytes
@@ -265,8 +290,7 @@ class AndroidAccessory(object):
                     try:
                         self._handle.bulkWrite(self._out_endpoint, buff_view[:length])
                     except usb1.USBError as err:
-                        eprint("Error writing data")
-                        eprint(err.args)
+                        eprint("Error writing data: %s" % err)
 
     def connect_socket(self, session_id):
         """
@@ -281,7 +305,8 @@ class AndroidAccessory(object):
             new_sock.connect(('localhost', self.port))
         except socket.error:
             eprint("Unable to connect to socket")
-            self.send_accessory_command(CMD_DISCONNECT_SOCKET, session_id)
+            data = pack('>HH', session_id, 0)
+            self.send_accessory_command(CMD_CONNECTION_RESP, data)
             return False
         else:
             eprint("Socket Connected")
@@ -294,6 +319,8 @@ class AndroidAccessory(object):
 
             # Add to map associating socket IDs with sockets
             self._socket_dict[session_id] = new_sock
+            data = pack('>HH', session_id, 1)
+            self.send_accessory_command(CMD_CONNECTION_RESP, data)
             return True
 
 
@@ -348,28 +375,23 @@ class AndroidAccessory(object):
             # give one second for transfers to complete
             time.sleep(1)
             self._is_running = False
+            self._socket_selector.close()
             for sock in self._socket_dict.values():
                 sock.close()
             self._socket_dict.clear()
             # TODO: should reset device
-            self._handle.releaseInterface(0)
-            self._handle.close()
-            self._handle = None
 
     def run(self):
         try:
-            while any(x.isSubmitted() for x in self._read_list):
+            while self._is_running:
                 try:
                     self._context.handleEvents()
                 except usb1.USBErrorInterrupted:
                     pass
-                if not self._is_running:
-                    for xfer in self._read_list:
-                        if xfer.isSubmitted():
-                            xfer.cancel()
-                    break
+        #except usb1.USBError as err:
+         #   eprint(err)
         finally:
-            self.stop()
+            self._handle.releaseInterface(0)
 
 SHUTDOWN = False
 
@@ -426,8 +448,8 @@ def setup_signal_exit(accessory):
 def open_accessory(context, vid, pid):
     try:
         accessory = AndroidAccessory(context, vid, pid)
-    except usb1.USBError:
-        pass
+    except usb1.USBError as err:
+        eprint(err)
     else:
         setup_signal_exit(accessory)
         accessory.run()

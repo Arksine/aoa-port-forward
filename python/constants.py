@@ -18,6 +18,7 @@ ACCESSORY_PID = (0x2D00, 0x2D01, 0x2D04, 0x2D05)
 # Command values to be sent to the accessory
 CMD_NONE = b'\x00\x00'
 CMD_CONNECT_SOCKET = b'\x01\x01'
+CMD_CONNECTION_RESP = b'\x01\0x02'
 CMD_DISCONNECT_SOCKET = b'\x02\x01'
 CMD_DATA_PACKET = b'\x03\x01'
 CMD_ACCESSORY_CONNECTED = b'\x04\x01'

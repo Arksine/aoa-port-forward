@@ -15,9 +15,14 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.InetAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.util.Iterator;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
@@ -45,8 +50,7 @@ class AccessoryServer {
 
     interface Callbacks {
         void onAccessoryConnected(boolean connected, int numClients);
-        void onSocketConnected(int numClients);
-        void onSocketDisconnected(int numClients);
+        void onConnectionUpdate(int connectionCount);
         void onError(String error);
         void onClose();
     }
@@ -88,21 +92,22 @@ class AccessoryServer {
     private FileInputStream mAccessoryInputStream = null;
     private FileOutputStream mAccessoryOutputStream = null;
 
-    private volatile ServerSocket mServerSocket = null;
-    private AtomicReferenceArray<ClientSocket> mSocketArray;
+    private Selector mSelector = null;
+    private volatile ServerSocketChannel mServerChannel = null;
+    private volatile AtomicReferenceArray<SocketChannel> mSocketArray;
     private AtomicInteger mConnectionCount = new AtomicInteger(0);
     private int mMaxConnections = 40;
     private int localPort;
     private int remotePort;
 
     private Thread mAccessoryReadThread = null;
-    private Thread mConnectionListenerThread = null ;
+    private Thread mSocketThread = null ;
 
     AccessoryServer(Context context, Callbacks accCbs) {
         this.mContext = context;
         this.mAccessoryCallbacks = accCbs;
         this.mUsbManger = (UsbManager) mContext.getSystemService(Context.USB_SERVICE);
-        this.mSocketArray = new AtomicReferenceArray<ClientSocket>(mMaxConnections);
+        this.mSocketArray = new AtomicReferenceArray<SocketChannel>(mMaxConnections);
 
         registerReceiver();
     }
@@ -135,7 +140,7 @@ class AccessoryServer {
 
         if (this.mAccessoryConnected.get()) {
             // check to see if listener thread is running, if not start it
-            if (mConnectionListenerThread != null && mConnectionListenerThread.isAlive()) {
+            if (mSocketThread != null && mSocketThread.isAlive()) {
                 // make sure that the current connection is listening on the correct port
                 if (this.localPort == lPort && this.remotePort == rPort) {
                     mAccessoryCallbacks.onAccessoryConnected(true, mConnectionCount.get());
@@ -144,15 +149,15 @@ class AccessoryServer {
                     // TODO: I should do this in another thread to prevent blocking,
                     // or just disallow binding to a new socket without stopping the service
                     disconnectAllClients();
-                    Utils.closeItem(mServerSocket);
-                    Utils.stopThread(mConnectionListenerThread);
+                    Utils.closeItem(mServerChannel);
+                    Utils.stopThread(mSocketThread);
                 }
             }
 
             this.localPort = lPort;
             this.remotePort = rPort;
-            mConnectionListenerThread = new Thread(mConnectionListener);
-            mConnectionListenerThread.start();
+            mSocketThread = new Thread(mSocketSelector);
+            mSocketThread.start();
             mAccessoryCallbacks.onAccessoryConnected(true, 0);
             return;
         }
@@ -238,8 +243,8 @@ class AccessoryServer {
             mAccessoryConnected.set(true);
             mAccessoryReadThread = new Thread(null, mAccessoryReadRunnable, "Accessory Read Thread");
             mAccessoryReadThread.start();
-            mConnectionListenerThread = new Thread(null, mConnectionListener, "Connection Listener Thread");
-            mConnectionListenerThread.start();
+            mSocketThread = new Thread(null, mSocketSelector, "Connection Listener Thread");
+            mSocketThread.start();
             mAccessoryCallbacks.onAccessoryConnected(true, 0);
 
         } else {
@@ -279,12 +284,29 @@ class AccessoryServer {
         writeToAccessory(commandBuf, 6);
     }
 
+    private boolean writeToSocket(SocketChannel sc, byte[] input, int packetsize) {
+        int index = 6;  // Don't write the header to the socket
+        int bytesWritten;
+        ByteBuffer outBuf = ByteBuffer.wrap(input);
+        outBuf.limit(packetsize);
+        outBuf.position(index);
+        try {
+            while (index < packetsize) {
+                bytesWritten = sc.write(outBuf);
+                index += bytesWritten;
+                outBuf.position(index);
+            }
+        } catch (IOException e) {
+            Log.i(TAG, "Connection write error");
+            return false;
+        }
+        return true;
+    }
+
     private void disconnectAllClients() {
         if (mConnectionCount.get() > 0) {
-            for (int i = 0; i < mMaxConnections; i++) {
-                ClientSocket csocket = mSocketArray.getAndSet(i, null);
-                if (csocket != null)
-                    csocket.disconnect();
+            for (short i = 0; i < mMaxConnections; i++) {
+                disconnectSocket(i, false);
             }
         }
     }
@@ -299,8 +321,8 @@ class AccessoryServer {
             }
 
             // Grow the array
-            AtomicReferenceArray<ClientSocket> tempArray =
-                    new AtomicReferenceArray<ClientSocket>(mMaxConnections * 2);
+            AtomicReferenceArray<SocketChannel> tempArray =
+                    new AtomicReferenceArray<SocketChannel>(mMaxConnections * 2);
             for (int i = 0; i < mMaxConnections; i++) {
                 tempArray.set(i, mSocketArray.get(i));
             }
@@ -322,70 +344,102 @@ class AccessoryServer {
         return null;
     }
 
-    private final ClientSocket.Callbacks mClientSocketCallbacks = new ClientSocket.Callbacks() {
-        @Override
-        public void onWrite(final byte[] data, final int size) {
-            writeToAccessory(data, size);
+    private void disconnectSocket(short socketId, boolean updateService) {
+        SocketChannel socketChannel = mSocketArray.getAndSet(socketId, null);
+        if (socketChannel != null) {
+            Utils.closeItem(socketChannel);
+            mConnectionCount.decrementAndGet();
+
+            if (updateService) {
+                mAccessoryCallbacks.onConnectionUpdate(mConnectionCount.get());
+            }
         }
+    }
 
-        @Override
-        public void onDisconnect(final int socketId) {
-            int count = mConnectionCount.decrementAndGet();
-            mSocketArray.set(socketId, null);
-            writeCommand(PortCommand.DISCONNECT_SOCKET, (short)socketId);
-            mAccessoryCallbacks.onSocketDisconnected(count);
-        }
-
-        @Override
-        public void onError(final String error) {
-            // TODO:
-        }
-    };
-
-
-    private final Runnable mConnectionListener = new Runnable() {
+    private final Runnable mSocketSelector = new Runnable() {
         @Override
         public void run() {
-
-            try{
-                mServerSocket = new ServerSocket(localPort, 0, InetAddress.getByName("127.0.0.1"));
+            // set up selector and server
+            try {
+                mSelector = Selector.open();
+                mServerChannel = ServerSocketChannel.open();
+                mServerChannel.configureBlocking(false);
+                mServerChannel.socket().bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), localPort));
+                mServerChannel.register(mSelector, SelectionKey.OP_ACCEPT);
             } catch (IOException e) {
-                if (DEBUG) {
-                    e.printStackTrace();
+                Log.e(TAG, "Unable to Open and configure server socket connection");
+                if (mServerChannel != null && mServerChannel.isOpen()) {
+                    Utils.closeItem(mServerChannel);
                 }
                 return;
             }
 
-            while (!mServerSocket.isClosed()) {
-                Short socketid = createSocketId();
-                ClientSocket cSocket;
-                if (socketid == null) {
-                    // Max connections reached, stop the thread, sleep for 100ms and continue
-                    try {
-                        Thread.sleep(100);
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
-                    continue;
-                }
+            byte[] inputArray = new byte[8192];
+            ByteBuffer inputBuffer = ByteBuffer.wrap(inputArray);
+            inputBuffer.position(6);  // Leave space for the header when reading
+            Short nextSocketId = createSocketId();
+            int bytesRead;
 
+            while (mServerChannel.isOpen()) {
                 try {
-
-                    Socket connection = mServerSocket.accept();
-                    cSocket = new ClientSocket(connection, socketid,
-                            mClientSocketCallbacks);
+                    mSelector.select();
                 } catch (IOException e) {
-                    if (DEBUG) {
-                        e.printStackTrace();
-                    }
-                    mAccessoryCallbacks.onError("Unable to connect to socket");
-                    continue;
+                    Log.e(TAG, "Selector failed, exiting socket loop");
+                    break;
                 }
+                Set selectedKeys = mSelector.selectedKeys();
+                Iterator iter = selectedKeys.iterator();
 
-                int count = mConnectionCount.incrementAndGet();
-                mSocketArray.set(socketid, cSocket);
-                writeCommand(PortCommand.CONNECT_SOCKET, socketid);
-                mAccessoryCallbacks.onSocketConnected(count);
+                while (iter.hasNext()) {
+
+                    SelectionKey key = (SelectionKey) iter.next();
+
+                    if (key.isAcceptable()) {
+                        if (nextSocketId != null) {
+                            SocketChannel client;
+                            try {
+                                client = mServerChannel.accept();
+                                client.configureBlocking(false);
+                                client.register(mSelector, SelectionKey.OP_READ, nextSocketId);
+                            } catch (IOException e) {
+                                Log.i(TAG, "Unable to connect to client");
+                                continue;
+                            }
+                            mSocketArray.set(nextSocketId, client);
+                            mConnectionCount.incrementAndGet();
+                        }
+                        nextSocketId = createSocketId();
+                    } else if (key.isReadable()) {
+                        SocketChannel client = (SocketChannel) key.channel();
+                        try {
+                            bytesRead = client.read(inputBuffer);
+                        } catch (IOException e) {
+                            Log.i(TAG, "Socket read error, id: " + key.attachment());
+                            disconnectSocket((short)key.attachment(), true);
+                            continue;
+                        }
+                        if (bytesRead > 0) {
+                            // Add the header
+                            inputBuffer.flip();
+                            inputBuffer.put(PortCommand.DATA_PACKET.getBytes());
+                            inputBuffer.putShort((short)inputBuffer.limit());  // Total bytes in packet
+                            inputBuffer.putShort((short)key.attachment());
+                            writeToAccessory(inputArray, inputBuffer.limit());
+
+                            // Prepare for next read
+                            inputBuffer.clear();
+                            inputBuffer.position(6);
+                        } else if (bytesRead == -1) {
+                            // Socket disconnected
+                            disconnectSocket((short)key.attachment(), true);
+                        }
+                    }
+                    iter.remove();
+                }
+            }
+
+            if (mServerChannel.isOpen()){
+                Utils.closeItem(mServerChannel);
             }
         }
     };
@@ -394,20 +448,24 @@ class AccessoryServer {
         @Override
         public void run() {
             int bytesRead;
-            byte[] inputBuffer = new byte[16384];
+            byte[] inputArray = new byte[16384];
+            ByteBuffer inputBuffer = ByteBuffer.wrap(inputArray);
 
             outerloop:
             while (mAccessoryConnected.get()) {
                 try {
-                    bytesRead = mAccessoryInputStream.read(inputBuffer);
+                    bytesRead = mAccessoryInputStream.read(inputArray);
                 } catch (IOException e) {
                     break;
                 }
 
                 if (bytesRead >= 4) {
-                    ByteBuffer inBuf = ByteBuffer.wrap(inputBuffer);
-                    PortCommand cmd = PortCommand.getCommandFromValue(inBuf.getShort());
-                    int packetSize = inBuf.getShort() & 0xFFFF;
+                    // reset buffer
+                    inputBuffer.position(0);
+                    inputBuffer.limit(bytesRead);
+
+                    PortCommand cmd = PortCommand.getCommandFromValue(inputBuffer.getShort());
+                    int packetSize = inputBuffer.getShort() & 0xFFFF;
 
                     if (packetSize != bytesRead) {
                         Log.i(TAG, "Error, Incorrect number of bytes received");
@@ -415,19 +473,34 @@ class AccessoryServer {
                     } else {
                         switch (cmd) {
                             case CONNECT_SOCKET:
-                            case DISCONNECT_SOCKET: // TODO: This could be an error response, need to handle it
+                            case DISCONNECT_SOCKET:
                             case ACCESSORY_CONNECTED:
                                 Log.i(TAG, "Should not receive command from server: " + cmd);
                                 break;
-                            case DATA_PACKET:
-                                Short id = inBuf.getShort();
-                                ClientSocket socket = mSocketArray.get(id);
-                                if (socket != null) {
-                                    socket.writeToClient(inputBuffer, packetSize);
+                            case DATA_PACKET: {
+                                Short id = inputBuffer.getShort();
+                                SocketChannel socketChannel = mSocketArray.get(id);
+                                if (socketChannel != null) {
+                                    if (!writeToSocket(socketChannel, inputArray, packetSize))
+                                        disconnectSocket(id, true);
                                 } else {
                                     Log.w(TAG, "No Socket Mapped to id: " + id);
                                 }
                                 break;
+                            }
+                            case CONNECTION_RESP: {
+                                Short id = inputBuffer.getShort();
+                                boolean response = (inputBuffer.getShort() > 0);
+                                if (response) {
+                                    // TODO: need a callback to update connected list count in
+                                    // notification
+                                } else {
+                                    // Socket didn't connect, remove it from the array and close,
+                                    // Don't need to update connection count as it hasn't been added
+                                    disconnectSocket(id, false);
+                                }
+                                break;
+                            }
                             case TERMINATE_ACCESSORY:
                                 break outerloop;
                             default:
@@ -453,12 +526,13 @@ class AccessoryServer {
             // Attempt to close socket items
 
             mAccessoryConnected.set(false);
-            Utils.closeItem(mServerSocket);
+            Utils.closeItem(mServerChannel);
+            Utils.closeItem(mSelector);
 
             disconnectAllClients();
 
             // Stop socket threads
-            Utils.stopThread(mConnectionListenerThread);
+            Utils.stopThread(mSocketThread);
             // send terminate command, stop thread with a longer timeout (1000ms)
             writeCommand(PortCommand.TERMINATE_ACCESSORY);
             Utils.stopThread(mAccessoryReadThread, 1000);
@@ -466,11 +540,11 @@ class AccessoryServer {
             Utils.closeItem(mAccessoryOutputStream);
             Utils.closeItem(mFileDescriptor);
 
-            mServerSocket = null;
+            mServerChannel = null;
             mAccessoryInputStream = null;
             mAccessoryOutputStream = null;
             mFileDescriptor = null;
-            mConnectionListenerThread = null;
+            mSocketThread = null;
             mAccessoryReadThread = null;
             mAccessoryCallbacks.onClose();
         }
