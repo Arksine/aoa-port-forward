@@ -14,8 +14,6 @@ public class AccessoryActivity extends AppCompatActivity {
 
         Intent accIntent = getIntent();
         UsbAccessory accessory = accIntent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY);
-        // TODO: get accessory from parcelable and send it to Service, OR use a static
-        // singleton to store the accessory
         if (!Utils.isServiceRunning(PortForwardService.class, this)) {
             Intent startIntent = new Intent(this, PortForwardService.class);
             startIntent.putExtra(UsbManager.EXTRA_ACCESSORY, accessory);

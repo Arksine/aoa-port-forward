@@ -16,6 +16,7 @@ import android.hardware.usb.UsbManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.preference.PreferenceManager;
+import android.util.Log;
 
 import java.util.Locale;
 
@@ -134,17 +135,10 @@ public class PortForwardService extends Service {
         }
 
         @Override
-        public void onSocketConnected(int numClients) {
+        public void onConnectionUpdate(int connectionCount) {
             updateNotificationContent(
                     String.format(Locale.US, "Forwarding Port %1$d over USB\n" +
-                    "%2$d Client(s) connected", mLocalPort, numClients));
-        }
-
-        @Override
-        public void onSocketDisconnected(int numClients) {
-            updateNotificationContent(
-                    String.format(Locale.US, "Forwarding Port %1$d over USB\n" +
-                    "%2$d Client(s) connected", mLocalPort, numClients));
+                            "%2$d Client(s) connected", mLocalPort, connectionCount));
         }
 
         @Override
@@ -167,8 +161,10 @@ public class PortForwardService extends Service {
             if (action.equals(getString(R.string.ACTION_STOP_SERVICE)) ||
                     action.equals(Intent.ACTION_SHUTDOWN)) {
                 if (mAccessoryServer != null && mAccessoryServer.isOpen()) {
+                    Log.i(TAG, "Closing Accessory");
                     mAccessoryServer.close();  // close the service, but not the accessory
                 } else {
+                    Log.i(TAG, "Accessory not open");
                     stopSelf();
                 }
             } else if (action.equals(getString(R.string.ACTION_CONNECT_ACCESSORY))) {

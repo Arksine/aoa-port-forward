@@ -1,5 +1,5 @@
 """ 
-TODO
+Same as android accessory, but uses sync io
 """
 #! python3
 # android_accessory_test.py
@@ -34,20 +34,21 @@ class ReadCallback(object):
         # TODO: probably need to share socket list (or just
         # access it through the accessory)
 
-    def __call__(self, transfer):
+    def __call__(self, in_buffer):
         """
         TODO: Docstring
         """
-        length = transfer.getActualLength()
-        if not length:
+        length = len(in_buffer)
+        if length == 0:
             return True
-        data = memoryview(transfer.getBuffer()[:length])
+        data = memoryview(in_buffer)
 
         # TODO: implement the if statements below
         if length >= 4:
             header = unpack('>2sH', data[:4])
             if header[1] != length:
-                eprint("Incoming packet does not match expected size")
+                eprint("Incoming packet does not match expected size:")
+                eprint(in_buffer)
             elif header[0] == CMD_CONNECT_SOCKET:
                 socket_id = unpack('>H', data[4:6])[0]
                 self._accessory.connect_socket(socket_id)
@@ -61,22 +62,27 @@ class ReadCallback(object):
                 if sock:
                     index = 6
                     while index < length:
-                        r, w, x = select.select([[], [sock.fileno()], []])
+                        r, w, x = select.select([], [sock.fileno()], [])
                         if w:
                             bytes_sent = sock.send(data[index:])
                             if bytes_sent == 0:
                                 eprint("Write error, socket broken")
                                 self._accessory.disconnect_socket(socket_id)
+                                # Error on server end, let app know
+                                self._accessory.send_accessory_command(CMD_DISCONNECT_SOCKET,
+                                                                       socket_id)
                                 break
                             else:
                                 index = index + bytes_sent
                 else:
                     eprint("Socket not valid: {0}".format(socket_id))
             elif header[0] == CMD_ACCESSORY_CONNECTED:
-                port = unpack('>H', data[4:6])[0]
+                port = unpack('>I', data[4:8])[0]
                 self._accessory.app_connected = True
                 self._accessory.port = port
+                eprint("App connected, fowarding port: {0}".format(port))
             elif header[0] == CMD_CLOSE_ACCESSORY:
+                eprint("Close accessory request recieved")
                 self._accessory.signal_app_exit()
             else:
                 eprint("Unknown Command:")
@@ -94,13 +100,12 @@ class AndroidAccessory(object):
         isconfigured, self._handle = self._find_handle(vendor_id, product_id)
 
         if isconfigured:
-            print("Device is in accessory mode")
+            print("Device already in accessory mode, attempting reset")
             # TODO: should I reset the device?
-            # self._handle.claimInterface(0)
-            # self._handle.resetDevice()
-            # time.sleep(2)
-            # isconfigured, self._handle = self._find_handle(vendor_id, product_id)
-            # self._handle = self._configure_accessory_mode()
+            #self._handle.claimInterface(0)
+            #self._handle.resetDevice()
+            #time.sleep(2)
+            #isconfigured, self._handle = self._find_handle(vendor_id, product_id)
         else:
             self._handle = self._configure_accessory_mode()
 
@@ -119,28 +124,14 @@ class AndroidAccessory(object):
                 'Unable to retreive endpoints for accessory device'
             )
 
-        read_callback = usb1.USBTransferHelper()
-        callback_obj = ReadCallback(self)
-        read_callback.setEventCallback(
-            usb1.TRANSFER_COMPLETED,
-            callback_obj,
-        )
-
-        self._read_list = []
-        for _ in range(64):
-            data_reader = self._handle.getTransfer()
-            data_reader.setBulk(
-                self._in_endpoint,
-                0x4000,
-                callback=read_callback,
-            )
-            data_reader.submit()
-            self._read_list.append(data_reader)
-
-
         self.port = 8000  # port to forward sockets to
         self.app_connected = False
         self._is_running = True
+
+        self._read_callback = ReadCallback(self)
+        self._accessory_read_thread = threading.Thread(target=self._accessory_read_thread_proc)
+        self._accessory_read_thread.start()
+
         self._socket_dict = {}
         self._socket_selector = selectors.DefaultSelector()
         self._socket_read_thread = threading.Thread(target=self._socket_read_thread_proc)
@@ -247,6 +238,20 @@ class AndroidAccessory(object):
                 print('Out endpoint address: %02x' % addr)
         return inep, outep
 
+    def _accessory_read_thread_proc(self):
+        while self._is_running:
+            try:
+                data = self._handle.bulkRead(self._in_endpoint, 16384)
+            except usb1.USBError as err:
+                if err.value == -7:  # timeout
+                    continue
+                eprint(err)
+                self.stop()
+            except OSError:
+                break
+            else:
+                self._read_callback(data)
+
     def _socket_read_thread_proc(self):
         """
         Uses a selector to loop through all connected sockets, listening
@@ -280,13 +285,17 @@ class AndroidAccessory(object):
                         bytes_read = key.fileobj.recv_into(buff_view[6:])
                     except EOFError:
                         # This socket has been closed, disconnect it
+                        eprint("Read error, EOF Reached")
                         self.disconnect_socket(key.data)
+                        self._accessory.send_accessory_command(CMD_DISCONNECT_SOCKET,
+                                                               key.data)
                         continue
                     length = bytes_read + 6  # add header to length
                     len_bytes = pack('>H', length)
                     id_bytes = pack('>H', key.data)
                     buff_view[2:4] = len_bytes
                     buff_view[4:6] = id_bytes
+
                     try:
                         self._handle.bulkWrite(self._out_endpoint, buff_view[:length])
                     except usb1.USBError as err:
@@ -300,16 +309,17 @@ class AndroidAccessory(object):
         """
         eprint("Connecting socket {0} on port {1}".format(session_id, self.port))
         new_sock = socket.socket()
-        new_sock.setblocking(False)
         try:
             new_sock.connect(('localhost', self.port))
-        except socket.error:
-            eprint("Unable to connect to socket")
-            data = pack('>HH', session_id, 0)
-            self.send_accessory_command(CMD_CONNECTION_RESP, data)
+        except socket.error as err:
+            eprint("Unable to connect to socket:")
+            eprint(err)
+            resp = pack('>HH', session_id, 0)
+            self.send_accessory_command(CMD_CONNECTION_RESP, resp)
             return False
         else:
             eprint("Socket Connected")
+            new_sock.setblocking(False)
             try:
                 # store the socket Id in the selector
                 self._socket_selector.register(new_sock, selectors.EVENT_READ, session_id)
@@ -319,12 +329,13 @@ class AndroidAccessory(object):
 
             # Add to map associating socket IDs with sockets
             self._socket_dict[session_id] = new_sock
-            data = pack('>HH', session_id, 1)
-            self.send_accessory_command(CMD_CONNECTION_RESP, data)
+            resp = pack('>HH', session_id, 1)
+            self.send_accessory_command(CMD_CONNECTION_RESP, resp)
             return True
 
 
     def disconnect_socket(self, session_id):
+        eprint("Disconnecting socket: {0}".format(session_id))
         try:
             sock = self._socket_dict[session_id]
             self._socket_selector.unregister(sock)
@@ -344,6 +355,7 @@ class AndroidAccessory(object):
 
     def send_accessory_command(self, command, data=None):
         length = 4      # base packet size
+
         if not data:
             packet = command + pack('>H', length)
         elif isinstance(data, bytes) or isinstance(data, bytearray):
@@ -355,6 +367,7 @@ class AndroidAccessory(object):
         else:
             eprint('Data type not acceptable')
             return
+
         self._handle.bulkWrite(self._out_endpoint, packet)
 
     def signal_app_exit(self):
@@ -363,6 +376,7 @@ class AndroidAccessory(object):
         Android to cleanly exit.
         """
         if self.app_connected:
+            eprint("Sending termination command to android")
             self.send_accessory_command(CMD_CLOSE_ACCESSORY)
             self.app_connected = False
 
@@ -371,62 +385,76 @@ class AndroidAccessory(object):
         Signals device if connected, Stops all threads, disconnects all sockets
         """
         if self._handle:
+            eprint("Stopping Accessory")
             self.signal_app_exit()
             # give one second for transfers to complete
             time.sleep(1)
             self._is_running = False
-            self._socket_selector.close()
-            for sock in self._socket_dict.values():
-                sock.close()
+            for sock in self._socket_dict.items():
+                try:
+                    self._socket_selector.unregister(sock)
+                except KeyError:
+                    pass
+                finally:
+                    sock.close()
+
             self._socket_dict.clear()
-            # TODO: should reset device
+            self._socket_selector.close()
+            self._socket_read_thread.join()
+            self._handle.releaseInterface(0)
+            self._handle.close()
+            self._handle = None
 
     def run(self):
         try:
+            # TODO: Should do something here
             while self._is_running:
-                try:
-                    self._context.handleEvents()
-                except usb1.USBErrorInterrupted:
-                    pass
-        #except usb1.USBError as err:
-         #   eprint(err)
+                time.sleep(1)
+
         finally:
-            self._handle.releaseInterface(0)
+            if self._handle:
+                self._handle.releaseInterface(0)
 
 SHUTDOWN = False
 
 def parse_uevent(data):
+    data = data.decode('utf-8')
     lines = data.split('\0')
-    keys = []
+    attrs = {}
     for line in lines:
         val = line.split('=')
         if len(val) == 2:
-            keys.append((val[0], val[1]))
+            attrs[val[0]] = val[1]
 
-    attributes = dict(keys)
-    if 'ACTION' in attributes and 'PRODUCT' in attributes:
-        if attributes['ACTION'] == 'add':
-            parts = attributes['PRODUCT'].split('/')
-            return int(parts[0], 16), int(parts[1], 16)
+    if 'ACTION' in attrs and 'PRODUCT' in attrs:
+        if attrs['ACTION'] == 'add':
+            parts = attrs['PRODUCT'].split('/')
+            eprint(parts)
+            return (int(parts[0], 16), int(parts[1], 16))
 
     return None, None
 
 def check_uevent():
     try:
-        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW,
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM,
                              NETLINK_KOBJECT_UEVENT)
 
         sock.bind((os.getpid(), -1))
         vid = 0
         pid = 0
-        while True:
-            data = sock.recv(512)
+        while not SHUTDOWN:
+            try:
+                data = sock.recv(512)
+            except InterruptedError:
+                break
+
             try:
                 vid, pid = parse_uevent(data)
-                if vid != None and pid != None:
-                    break
             except ValueError:
                 eprint("unable to parse uevent")
+            else:
+                if vid and pid:
+                    break
 
         sock.close()
         return vid, pid
@@ -445,17 +473,19 @@ def setup_signal_exit(accessory):
         signal.signal(signum, _exit)
 
 
-def open_accessory(context, vid, pid):
-    try:
-        accessory = AndroidAccessory(context, vid, pid)
-    except usb1.USBError as err:
-        eprint(err)
-    else:
-        setup_signal_exit(accessory)
-        accessory.run()
+def open_accessory(vid, pid):
+    with usb1.USBContext() as context:
+        try:
+            accessory = AndroidAccessory(context, vid, pid)
+        except usb1.USBError as err:
+            eprint(err)
+        else:
+            setup_signal_exit(accessory)
+            accessory.run()
 
 def main():
     # check args
+    setup_signal_exit(None)
     vid = None
     pid = None
     if len(sys.argv) == 3:
@@ -466,25 +496,26 @@ def main():
         if vid not in COMPATIBLE_VIDS:
             eprint("Vendor Id not a compatible Android Device")
             return
+        elif vid == ACCESSORY_VID and pid in ACCESSORY_PID:
+            eprint("Requested vid:pid combination is an accessory.\n \
+                    Please use the device's standard vid/pid")
+            return
 
-    # setup a base signal exit
-    setup_signal_exit(None)
-    with usb1.USBContext() as context:
-        while not SHUTDOWN:
-            # Initial Attempt to open
-            open_accessory(context, vid, pid)
+    while not SHUTDOWN:
+        # Initial Attempt to open
+        open_accessory(vid, pid)
 
-            if sys.platform == 'linux':
-                # listen for USB attach events (linux only)
-                while not SHUTDOWN:
-                    nvid, npid = check_uevent()
-                    if nvid in COMPATIBLE_VIDS:
-                        if (not vid and not pid) or (vid == nvid and pid == npid):
-                            open_accessory(context, nvid, npid)
-
-            else:
-                # sleep for 5 seconds between connection attempts
-                time.sleep(5)
+        if sys.platform == 'linux':
+            while not SHUTDOWN:
+                nvid, npid = check_uevent()
+                if nvid in COMPATIBLE_VIDS:
+                    if (not vid and not pid) or (vid == nvid and pid == npid):
+                        open_accessory(nvid, npid)
+                else:
+                    eprint("Vid: {0:x} not compatible".format(nvid))
+        elif not SHUTDOWN:
+            # sleep for 5 seconds between connection attempts
+            time.sleep(5)
 
 if __name__ == '__main__':
     main()

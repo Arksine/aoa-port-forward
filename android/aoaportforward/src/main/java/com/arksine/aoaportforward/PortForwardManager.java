@@ -28,6 +28,22 @@ public class PortForwardManager {
         }
     }
 
+    public static void startPortForwardService(Context context, int localPort, int remotePort) {
+        if (!Utils.isServiceRunning(PortForwardService.class, context)) {
+            Intent startIntent = new Intent(context, PortForwardService.class);
+            startIntent.putExtra(EXTRA_LOCAL_PORT, localPort);
+            startIntent.putExtra(EXTRA_REMOTE_PORT, remotePort);
+            context.startService(startIntent);
+        } else {
+            // Broadcast
+            Intent connectIntent = new Intent(context.getString(R.string.ACTION_CONNECT_ACCESSORY));
+            connectIntent.putExtra(EXTRA_LOCAL_PORT, localPort);
+            connectIntent.putExtra(EXTRA_REMOTE_PORT, remotePort);
+            context.sendBroadcast(connectIntent);
+        }
+    }
+
+
     public static void startPortForwardService(Context context, UsbAccessory accessory) {
         if (!Utils.isServiceRunning(PortForwardService.class, context)) {
             Intent startIntent = new Intent(context, PortForwardService.class);
