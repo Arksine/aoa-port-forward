@@ -150,6 +150,8 @@ public class PortForwardService extends Service {
         public void onClose() {
             // save ports to shared preferences
             PortForwardManager.setPorts(PortForwardService.this, mLocalPort, mRemotePort);
+
+            Log.i(TAG, "Stopping Service");
             stopSelf();
         }
     };

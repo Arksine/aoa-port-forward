@@ -18,7 +18,7 @@ import socket
 import select
 import usb1
 from constants import *
-
+import bytebuffer
 if sys.version_info > (3, 5):  # Python 3.5+
     import selectors
 else:  # Python 2.6 - 3.4
@@ -31,66 +31,120 @@ class ReadCallback(object):
     """
     def __init__(self, acc):
         self._accessory = acc
-        # TODO: probably need to share socket list (or just
-        # access it through the accessory)
+        self._command = None
+        self._payload_size = 0
+        self._split_header = False
+        self._split_payload = False
+
+        self._split_header_buffer = bytebuffer.allocate(4)
+        self._split_payload_buffer = bytebuffer.allocate(8192)
 
     def __call__(self, in_buffer):
         """
         TODO: Docstring
         """
-        length = len(in_buffer)
-        if length == 0:
-            return True
-        data = memoryview(in_buffer)
-
-        # TODO: implement the if statements below
-        if length >= 4:
-            header = unpack('>2sH', data[:4])
-            if header[1] != length:
-                eprint("Incoming packet does not match expected size:")
-                eprint(in_buffer)
-            elif header[0] == CMD_CONNECT_SOCKET:
-                socket_id = unpack('>H', data[4:6])[0]
-                self._accessory.connect_socket(socket_id)
-            elif header[0] == CMD_DISCONNECT_SOCKET:
-                socket_id = unpack('>H', data[4:6])[0]
-                self._accessory.disconnect_socket(socket_id)
-            elif header[0] == CMD_DATA_PACKET:
-                # Demux and write to socket
-                socket_id = unpack('>H', data[4:6])[0]
-                sock = self._accessory.get_socket(socket_id)
-                if sock:
-                    index = 6
-                    while index < length:
-                        r, w, x = select.select([], [sock.fileno()], [])
-                        if w:
-                            bytes_sent = sock.send(data[index:])
-                            if bytes_sent == 0:
-                                eprint("Write error, socket broken")
-                                self._accessory.disconnect_socket(socket_id)
-                                # Error on server end, let app know
-                                self._accessory.send_accessory_command(CMD_DISCONNECT_SOCKET,
-                                                                       socket_id)
-                                break
-                            else:
-                                index = index + bytes_sent
+        data = bytebuffer.wrap(in_buffer)
+        eprint("Packet Length: {0}".format(len(in_buffer)))
+        # Loop while able to process header
+        while data.remaining() >= 4:
+            if self._split_header:
+                eprint("Split Header Detected")
+                if self._split_header_buffer.hasRemaining():
+                    self._split_header_buffer.fill(data)
+                self._split_header_buffer.flip()
+                self._command = self._split_header_buffer.getBytes(2)
+                self._payload_size = self._split_header_buffer.getShort()
+                self._split_header = False
+                self._split_header_buffer.clear()
+            elif self._split_payload:
+                eprint("Split Payload Detected")
+                self._split_payload_buffer.fill(data)
+                if self._split_payload_buffer.hasRemaining():
+                    # data packet didn't contain entire payload
+                    break
                 else:
-                    eprint("Socket not valid: {0}".format(socket_id))
-            elif header[0] == CMD_ACCESSORY_CONNECTED:
-                port = unpack('>I', data[4:8])[0]
-                self._accessory.app_connected = True
-                self._accessory.port = port
-                eprint("App connected, fowarding port: {0}".format(port))
-            elif header[0] == CMD_CLOSE_ACCESSORY:
-                eprint("Close accessory request recieved")
-                self._accessory.signal_app_exit()
+                    self._split_payload_buffer.flip()
+                    self._process_packet(self._split_payload_buffer)
+                    self._split_payload_buffer.clear()
+                    self._split_payload = False
+                    continue
             else:
-                eprint("Unknown Command:")
-                eprint(header[0])
-        else:
-            eprint("Incoming packet too small")
+                self._command = data.getBytes(2)
+                self._payload_size = data.getShort()
 
-        return True
+            if self._payload_size == 0:
+                # packet has no payload, process it
+                self._process_packet(None)
+            elif self._payload_size <= data.remaining():
+                # entire payload is in packet, process it
+                payload = data.duplicate()
+                payload.limit = payload.position + self._payload_size
+                self._process_packet(payload)
+                data.position = data.position + self._payload_size
+            else:
+                eprint("Remaining packet not contained in current buffer")
+                if data.hasRemaining():
+                    self._split_payload_buffer.put(data)
+                self._split_payload_buffer.limit = self._payload_size
+                self._split_payload = True
+
+        if data.hasRemaining():
+            if data.remaining() <= self._split_header_buffer.remaining():
+                self._split_header_buffer.put(data)
+                self._split_header = True
+            else:
+                # fill remaining header, process it, then put
+                # what is left of the data in split packet
+                self._split_header_buffer.fill(data)
+                self._split_header_buffer.flip()
+                self._command = self._split_header_buffer.getBytes(2)
+                self._payload_size = self._split_header_buffer.getShort()
+                self._split_header = False
+                self._split_header_buffer.clear()
+                if data.hasRemaining():
+                    self._split_payload_buffer.limit = self._payload_size
+                    self._split_payload_buffer.put(data)
+                    self._split_payload = True
+
+    def _process_packet(self, payload):
+        if self._command == CMD_CONNECT_SOCKET:
+            socket_id = payload.getShort()
+            self._accessory.connect_socket(socket_id)
+        elif self._command == CMD_DISCONNECT_SOCKET:
+            socket_id = payload.getShort()
+            self._accessory.disconnect_socket(socket_id)
+        elif self._command == CMD_DATA_PACKET:
+            # Demux and write to socket
+            socket_id = payload.getShort()
+            sock = self._accessory.get_socket(socket_id)
+            if sock:
+                while payload.hasRemaining():
+                    r, w, x = select.select([], [sock.fileno()], [])
+                    if w:
+                        bytes_sent = sock.send(payload[payload.position:payload.limit])
+                        if bytes_sent == 0:
+                            eprint("Write error, socket broken")
+                            self._accessory.disconnect_socket(socket_id)
+                            # Error on server end, let app know
+                            self._accessory.send_accessory_command(CMD_DISCONNECT_SOCKET,
+                                                                   socket_id)
+                            payload.position = payload.limit
+                            break
+                        else:
+                            payload.position = payload.position + bytes_sent
+            else:
+                eprint("Socket not valid: {0}".format(socket_id))
+        elif self._command == CMD_ACCESSORY_CONNECTED:
+            port = payload.getInt()
+            self._accessory.app_connected = True
+            self._accessory.port = port
+            eprint("App connected, fowarding port: {0}".format(port))
+        elif self._command == CMD_CLOSE_ACCESSORY:
+            eprint("Close accessory request recieved")
+            self._accessory.signal_app_exit()
+        else:
+            eprint("Unknown Command:")
+            eprint(self._command)
 
 
 class AndroidAccessory(object):
@@ -144,7 +198,7 @@ class AndroidAccessory(object):
             if vendor_id and product_id:
                 # match by vendor and product id
                 if (device.getVendorID() == vendor_id and
-                        device.getProductID == product_id):
+                        device.getProductID() == product_id):
                     handle = self._open_device(device)
                     if handle:
                         found_dev = device
@@ -241,12 +295,12 @@ class AndroidAccessory(object):
     def _accessory_read_thread_proc(self):
         while self._is_running:
             try:
-                data = self._handle.bulkRead(self._in_endpoint, 16384)
+                data = self._handle.bulkRead(self._in_endpoint, 16384, timeout=1000)
             except usb1.USBError as err:
                 if err.value == -7:  # timeout
                     continue
                 eprint(err)
-                self.stop()
+                break
             except OSError:
                 break
             else:
@@ -263,10 +317,10 @@ class AndroidAccessory(object):
                 time.sleep(.001)
                 if not self._is_running:
                     return []
-            return self._socket_selector.select()
+            return self._socket_selector.select(timeout=1)
 
         def _nix_select():
-            return self._socket_selector.select()
+            return self._socket_selector.select(timeout=1)
 
         if sys.platform == 'win32':
             select_func = _win_select
@@ -277,8 +331,9 @@ class AndroidAccessory(object):
         buff_view = memoryview(buffer)
         buff_view[0:2] = CMD_DATA_PACKET
         while self._is_running:
-            # TODO: On windows I can't do this when no sockets are registered
             events = select_func()
+            if len(events) == 0:
+                continue
             for key, event in events:
                 if event & selectors.EVENT_READ:
                     try:
@@ -290,16 +345,21 @@ class AndroidAccessory(object):
                         self._accessory.send_accessory_command(CMD_DISCONNECT_SOCKET,
                                                                key.data)
                         continue
-                    length = bytes_read + 6  # add header to length
-                    len_bytes = pack('>H', length)
-                    id_bytes = pack('>H', key.data)
-                    buff_view[2:4] = len_bytes
-                    buff_view[4:6] = id_bytes
-
-                    try:
-                        self._handle.bulkWrite(self._out_endpoint, buff_view[:length])
-                    except usb1.USBError as err:
-                        eprint("Error writing data: %s" % err)
+                    if bytes_read > 0:
+                        # payload size (socket id is part of payload)
+                        payload_size = bytes_read + 2
+                        payload_bytes = pack('>H', payload_size)
+                        id_bytes = pack('>H', key.data)
+                        buff_view[2:4] = payload_bytes
+                        buff_view[4:6] = id_bytes
+                        length = bytes_read + 6
+                        try:
+                            self._handle.bulkWrite(self._out_endpoint, buff_view[:length])
+                        except usb1.USBError as err:
+                            eprint("Error writing data: %s" % err)
+                    else:
+                        # TODO: disconnect?
+                        pass
 
     def connect_socket(self, session_id):
         """
@@ -354,16 +414,16 @@ class AndroidAccessory(object):
         return self._socket_dict.get(session_id)
 
     def send_accessory_command(self, command, data=None):
-        length = 4      # base packet size
-
         if not data:
-            packet = command + pack('>H', length)
+            # empty payload
+            packet = command + pack('>H', 0)
         elif isinstance(data, bytes) or isinstance(data, bytearray):
-            length += len(data)
+            # payload size is variable
+            length = len(data)
             packet = command + pack('>H', length) + data
         elif isinstance(data, int):
-            length = 6
-            packet = command + pack('>H', length) + pack('>H', data)
+            # payload is unsigned short
+            packet = command + pack('>H', 2) + pack('>H', data)
         else:
             eprint('Data type not acceptable')
             return
@@ -384,13 +444,13 @@ class AndroidAccessory(object):
         """
         Signals device if connected, Stops all threads, disconnects all sockets
         """
-        if self._handle:
+        if self._is_running:
             eprint("Stopping Accessory")
             self.signal_app_exit()
+            self._is_running = False
             # give one second for transfers to complete
             time.sleep(1)
-            self._is_running = False
-            for sock in self._socket_dict.items():
+            for sock in self._socket_dict.values():
                 try:
                     self._socket_selector.unregister(sock)
                 except KeyError:
@@ -400,20 +460,22 @@ class AndroidAccessory(object):
 
             self._socket_dict.clear()
             self._socket_selector.close()
+            eprint("Waiting for socket thread to close...")
             self._socket_read_thread.join()
             self._handle.releaseInterface(0)
-            self._handle.close()
-            self._handle = None
+            eprint("Waiting for accessory thread to close...")
+            self._accessory_read_thread.join()
 
     def run(self):
         try:
             # TODO: Should do something here
             while self._is_running:
                 time.sleep(1)
-
+        except SystemExit:
+            pass
         finally:
             if self._handle:
-                self._handle.releaseInterface(0)
+                self.stop()
 
 SHUTDOWN = False
 
@@ -442,10 +504,10 @@ def check_uevent():
         sock.bind((os.getpid(), -1))
         vid = 0
         pid = 0
-        while not SHUTDOWN:
+        while True:
             try:
                 data = sock.recv(512)
-            except InterruptedError:
+            except (InterruptedError, SystemExit):
                 break
 
             try:
@@ -461,13 +523,12 @@ def check_uevent():
     except ValueError as err:
         eprint(err)
 
-def setup_signal_exit(accessory):
+def setup_signal_exit():
     def _exit(sig, stack):
         eprint('Exiting...')
         global SHUTDOWN
         SHUTDOWN = True
-        if accessory is not None:
-            accessory.stop()
+        raise SystemExit
 
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, _exit)
@@ -479,13 +540,14 @@ def open_accessory(vid, pid):
             accessory = AndroidAccessory(context, vid, pid)
         except usb1.USBError as err:
             eprint(err)
+        except SystemExit:
+            pass
         else:
-            setup_signal_exit(accessory)
             accessory.run()
 
 def main():
     # check args
-    setup_signal_exit(None)
+    setup_signal_exit()
     vid = None
     pid = None
     if len(sys.argv) == 3:
@@ -500,6 +562,7 @@ def main():
             eprint("Requested vid:pid combination is an accessory.\n \
                     Please use the device's standard vid/pid")
             return
+
 
     while not SHUTDOWN:
         # Initial Attempt to open
@@ -516,6 +579,7 @@ def main():
         elif not SHUTDOWN:
             # sleep for 5 seconds between connection attempts
             time.sleep(5)
+
 
 if __name__ == '__main__':
     main()

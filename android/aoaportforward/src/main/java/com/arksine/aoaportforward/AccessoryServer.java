@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.hardware.usb.UsbAccessory;
 import android.hardware.usb.UsbManager;
+import android.os.Handler;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
@@ -21,11 +22,11 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
-import java.util.Enumeration;
 import java.util.Iterator;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 
 /**
@@ -42,8 +43,9 @@ class AccessoryServer {
     private static final String MANUFACTURER = "Arksine";
     private static final String MODEL = "PortForward";
     private static final String ACTION_USB_PERMISSION = "com.arksine.aoaportforward.USB_PERMISSION";
+    private static final int HARD_CONNECTION_LIMIT = 640;
 
-    private final Object WRITE_LOCK = new Object();
+    private final Object ACC_WRITE_LOCK = new Object();
 
     interface Callbacks {
         void onAccessoryConnected(boolean connected, int numClients);
@@ -91,19 +93,21 @@ class AccessoryServer {
 
     private Selector mSelector = null;
     private volatile ServerSocketChannel mServerChannel = null;
-    private ConcurrentHashMap<Short, SocketChannel> mSocketMap;
+    private volatile AtomicReferenceArray<SocketChannel> mSocketArray;
+    private AtomicInteger mConnectionCount = new AtomicInteger(0);
     private int mMaxConnections = 40;
     private int localPort;
     private int remotePort;
 
     private Thread mAccessoryReadThread = null;
     private Thread mSocketThread = null ;
+    private Handler mSocketEventHandler;
 
     AccessoryServer(Context context, Callbacks accCbs) {
         this.mContext = context;
         this.mAccessoryCallbacks = accCbs;
         this.mUsbManger = (UsbManager) mContext.getSystemService(Context.USB_SERVICE);
-        this.mSocketMap = new ConcurrentHashMap<>(mMaxConnections);
+        this.mSocketArray = new AtomicReferenceArray<SocketChannel>(mMaxConnections);
 
         registerReceiver();
     }
@@ -139,7 +143,7 @@ class AccessoryServer {
             if (mSocketThread != null && mSocketThread.isAlive()) {
                 // make sure that the current connection is listening on the correct port
                 if (this.localPort == lPort && this.remotePort == rPort) {
-                    mAccessoryCallbacks.onAccessoryConnected(true, mSocketMap.size());
+                    mAccessoryCallbacks.onAccessoryConnected(true, mConnectionCount.get());
                     return;
                 } else {
                     // TODO: I should do this in another thread to prevent blocking,
@@ -237,7 +241,6 @@ class AccessoryServer {
             mAccessoryInputStream = new FileInputStream(fd);
 
             mAccessoryConnected.set(true);
-            // TODO: need to make remote port an int, as it can go up to 99999
             writeCommand(PortCommand.ACCESSORY_CONNECTED, remotePort);
             mAccessoryReadThread = new Thread(null, mAccessoryReadRunnable, "Accessory Read Thread");
             mAccessoryReadThread.start();
@@ -251,11 +254,11 @@ class AccessoryServer {
         }
     }
 
-    private void writeToAccessory(byte[] data, int packetSize) {
+    private void writeToAccessory(byte[] data, int length) {
         if (mAccessoryOutputStream != null) {
-            synchronized (WRITE_LOCK) {
+            synchronized (ACC_WRITE_LOCK) {
                 try {
-                    mAccessoryOutputStream.write(data, 0, packetSize);
+                    mAccessoryOutputStream.write(data, 0, length);
                     mAccessoryOutputStream.flush();
                 } catch (IOException e) {
                     close();
@@ -267,7 +270,7 @@ class AccessoryServer {
     private void writeCommand(PortCommand command) {
         byte[] commandBuf = ByteBuffer.allocate(4)
                 .put(command.getBytes())
-                .putShort((short)4)
+                .putShort((short)0) // empty payload
                 .array();
 
         writeToAccessory(commandBuf, 4);
@@ -276,7 +279,7 @@ class AccessoryServer {
     private void writeCommand(PortCommand command, short data) {
         byte[] commandBuf = ByteBuffer.allocate(6)
                 .put(command.getBytes())
-                .putShort((short)6)
+                .putShort((short)2)  // two byte payload (sizeof short)
                 .putShort((data))
                 .array();
 
@@ -286,7 +289,7 @@ class AccessoryServer {
     private void writeCommand(PortCommand command, int data) {
         byte[] commandBuf = ByteBuffer.allocate(8)
                 .put(command.getBytes())
-                .putShort((short)8)
+                .putShort((short)4)  // four byte payload (sizeof integer)
                 .putInt(data)
                 .array();
 
@@ -294,35 +297,65 @@ class AccessoryServer {
     }
 
 
-    private boolean writeToSocket(SocketChannel sc, byte[] input, int packetsize) {
-        ByteBuffer outBuf = ByteBuffer.wrap(input);
-        outBuf.limit(packetsize);
-        outBuf.position(6); // Don't write the header to the socket
-        try {
-            while (outBuf.hasRemaining()) {
-                sc.write(outBuf);
+    private boolean writeToSocket(short socket_id, ByteBuffer outBuf) {
+        // TODO: Need to synchronize writes and disconnects, so a socket that reads EOF doesn't
+        // disconnect in the middle of a write
+        SocketChannel socketChannel = mSocketArray.get(socket_id);
+        if (socketChannel != null) {
+            synchronized (socketChannel.socket()) {
+                if (DEBUG)
+                    Log.d(TAG, "Writing to socket: " + socket_id + "\n" +
+                            " Length: " + outBuf.remaining());
+                try {
+                    while (outBuf.hasRemaining()) {
+                        socketChannel.write(outBuf);
+                    }
+                } catch (IOException e) {
+                    Log.i(TAG, "Connection write error");
+                    // because the connection failed, whatever is left in this buffer
+                    outBuf.position(outBuf.limit());
+                    return false;
+                }
             }
-        } catch (IOException e) {
-            Log.i(TAG, "Connection write error");
-            return false;
+
+        } else {
+            if (DEBUG)
+                Log.w(TAG, "No Socket Mapped to id: " + socket_id);
+
         }
         return true;
     }
 
     private void disconnectAllClients() {
-        for (Enumeration<Short> socketKeys = mSocketMap.keys(); socketKeys.hasMoreElements();) {
-            disconnectSocket(socketKeys.nextElement(), true, false);
+        if (mConnectionCount.get() > 0) {
+            for (int i = 0; i < mMaxConnections; i++) {
+                disconnectSocket((short)i, true, false);
+            }
         }
     }
 
     private Short createSocketId() {
-        int socketId = mSocketMap.size();
+        int socketId = mConnectionCount.get();
 
-        if (socketId > mMaxConnections)
-            mMaxConnections = mMaxConnections * 2;
+
+        // Check the size, grow the array if necessary up to the Hard connection limit
+        if (socketId == mMaxConnections) {
+            if (mMaxConnections >= HARD_CONNECTION_LIMIT) {
+                return null;
+            }
+
+            // Grow the array
+            AtomicReferenceArray<SocketChannel> tempArray =
+                    new AtomicReferenceArray<SocketChannel>(mMaxConnections * 2);
+            for (int i = 0; i < mMaxConnections; i++) {
+                tempArray.set(i, mSocketArray.get(i));
+            }
+            mMaxConnections *= 2;
+            mSocketArray = tempArray;
+        }
 
         for (int j = 0; j < mMaxConnections; j++) {
-            if (!mSocketMap.containsKey((short)socketId)) {
+            if (mSocketArray.get(socketId) == null) {
                 return (short)socketId;
             }
 
@@ -336,18 +369,24 @@ class AccessoryServer {
     }
 
     private void disconnectSocket(short socketId, boolean sendResponse, boolean updateService) {
-        SocketChannel socketChannel = mSocketMap.remove(socketId);
+        // TODO: need to synchronize with writes so a socket isn't disconnected
+        SocketChannel socketChannel = mSocketArray.getAndSet(socketId, null);
         if (socketChannel != null) {
             if (DEBUG)
                 Log.d(TAG, "Disconnect socket id: "+ socketId);
-            Utils.closeItem(socketChannel);
+
+            // TODO: Id rather synchronize on a field of the sc
+            synchronized (socketChannel.socket()) {
+                Utils.closeItem(socketChannel);
+            }
+            int count = mConnectionCount.decrementAndGet();
 
             if (sendResponse) {
             writeCommand(PortCommand.DISCONNECT_SOCKET, socketId);
-
             }
+
             if (updateService) {
-                mAccessoryCallbacks.onConnectionUpdate(mSocketMap.size());
+                mAccessoryCallbacks.onConnectionUpdate(count);
             }
         }
     }
@@ -406,7 +445,8 @@ class AccessoryServer {
                                 continue;
                             }
                             writeCommand(PortCommand.CONNECT_SOCKET, nextSocketId); // tell connection to start
-                            mSocketMap.put(nextSocketId, client);
+                            mConnectionCount.incrementAndGet(); // Increment current connection count
+                            mSocketArray.set(nextSocketId, client);
                         }
                         nextSocketId = createSocketId();
                     } else if (key.isReadable()) {
@@ -422,7 +462,7 @@ class AccessoryServer {
                             // Add the header
                             inputBuffer.flip();
                             inputBuffer.put(PortCommand.DATA_PACKET.getBytes());
-                            inputBuffer.putShort((short)inputBuffer.limit());  // Total bytes in packet
+                            inputBuffer.putShort((short)(bytesRead + 2));  // Payload = bytes read + socket id
                             inputBuffer.putShort((short)key.attachment());
                             writeToAccessory(inputArray, inputBuffer.limit());
 
@@ -432,7 +472,12 @@ class AccessoryServer {
                         } else if (bytesRead == -1) {
                             // Socket disconnected
                             if (DEBUG)
-                                Log.d(TAG, "EOF Reached, Socked Id: " + key.attachment());
+                                Log.d(TAG, "EOF Reached, Socket Id: " + key.attachment());
+                            // TODO: In theory I shouldn't need to send a disconnect, as the server
+                            // Should know to disconnect, correct?  Is this always applicable to
+                            // EOF reads? (ie: if the socket sends EOF, we are sure that
+                            // the server's respose will send an EOF, and the server will never
+                            // send EOF before the socket
                             disconnectSocket((short)key.attachment(), true, true);
                         }
                     }
@@ -447,92 +492,104 @@ class AccessoryServer {
     };
 
     private final Runnable mAccessoryReadRunnable = new Runnable() {
+        private int mBytesRead;
+        private PortCommand mCurrentCommand = PortCommand.NONE;
+        private int mPayloadSize = 0;
+        private byte[] mInputArray = new byte[16384];
+        private ByteBuffer mInputBuffer;
+        private ByteBuffer mSplitHeaderBuffer = ByteBuffer.allocate(4);
+        private ByteBuffer mSplitPayloadBuffer = ByteBuffer.allocateDirect(8192);
+        private boolean mPayloadSplit = false;
+        private boolean mHeaderSplit = false;
+
         @Override
         public void run() {
-            int bytesRead;
-            byte[] inputArray = new byte[16384];
-            ByteBuffer inputBuffer = ByteBuffer.wrap(inputArray);
-
+            mInputBuffer = ByteBuffer.wrap(mInputArray);
             outerloop:
             while (mAccessoryConnected.get()) {
                 try {
-                    bytesRead = mAccessoryInputStream.read(inputArray);
+                    mBytesRead = mAccessoryInputStream.read(mInputArray);
                 } catch (IOException e) {
                     break;
                 }
 
-                if (bytesRead >= 4) {
+                if (mBytesRead > 0) {
+                    if (DEBUG)
+                        Log.d(TAG, "Bytes read: " + mBytesRead);
                     // reset buffer
-                    inputBuffer.position(0);
-                    inputBuffer.limit(bytesRead);
+                    mInputBuffer.position(0);
+                    mInputBuffer.limit(mBytesRead);
 
-                    PortCommand cmd = PortCommand.getCommandFromValue(inputBuffer.getShort());
-                    int packetSize = inputBuffer.getShort() & 0xFFFF;
+                    while (mInputBuffer.remaining() >= 4) {
+                        if (mHeaderSplit) {
+                            processSplitHeader();
+                        } else if (mPayloadSplit) {
+                            // Payload split between packets, assemble and process
+                            Utils.bufferFill(mSplitPayloadBuffer, mInputBuffer);
+                            if (mSplitPayloadBuffer.hasRemaining()) {
+                                Log.w(TAG, "Payload remaining larger than incoming packet.\n" +
+                                        "This should not happen as usb transfers are larger than" +
+                                        " Socket transfers");
+                                break;
+                            } else {
+                                // overflow payload is in current buffer process
+                                mSplitPayloadBuffer.flip();
 
-                    if (packetSize != bytesRead) {
-                        Log.i(TAG, "Error, Incorrect number of bytes received");
-                        if (DEBUG) {
-                            Log.d(TAG, "Commmand: " + cmd + "\n" +
-                                    "Input Size: " + packetSize + "\n" +
-                                    "Acutal Size: " + bytesRead);
+                                // Process packet, check for termination
+                                if (!processPacket(mCurrentCommand, mSplitPayloadBuffer))
+                                    break outerloop;
 
-                            Log.d(TAG, "Actual Buffer: \n" +
-                                Utils.bytesToHex(inputArray, bytesRead));
+                                mSplitPayloadBuffer.clear();
+                                mPayloadSplit = false;
 
+                                // Continue the next loop to check input buffer size and get
+                                // next command
+                                continue;
+                            }
+                        } else {
+                            // Header is the next part of the buffer, retreive it
+                            mCurrentCommand = PortCommand.getCommandFromValue(mInputBuffer.getShort());
+                            mPayloadSize = mInputBuffer.getShort() & 0xFFFF;
                         }
-                    } else {
-                        switch (cmd) {
-                            case CONNECT_SOCKET:
-                            case ACCESSORY_CONNECTED:
-                                Log.i(TAG, "Should not receive command from server: " + cmd);
-                                break;
-                            case DISCONNECT_SOCKET: {
-                                Log.i(TAG, "Server disconnected socket");
-                                Short id = inputBuffer.getShort();
-                                disconnectSocket(id, false, true);
-                                break;
-                            }
-                            case DATA_PACKET: {
-                                Short id = inputBuffer.getShort();
-                                SocketChannel socketChannel = mSocketMap.get(id);
-                                if (socketChannel != null) {
-                                    if (DEBUG)
-                                        Log.d(TAG, "Writing to socket: " + id + "\n" +
-                                                " Connection status: " + socketChannel.isConnected());
-                                    if (!writeToSocket(socketChannel, inputArray, packetSize))
-                                        disconnectSocket(id, true, true);
-                                } else {
-                                    if (DEBUG)
-                                        Log.w(TAG, "No Socket Mapped to id: " + id);
-                                }
-                                break;
-                            }
-                            case CONNECTION_RESP: {
-                                Short id = inputBuffer.getShort();
-                                boolean response = (inputBuffer.getShort() > 0);
 
-                                if (response) {
-                                    if (DEBUG)
-                                        Log.d(TAG, "Response success, Socket Id: " + id);
-                                    mAccessoryCallbacks.onConnectionUpdate(mSocketMap.size());
-                                } else {
-                                    // Socket didn't connect, remove it from the array and close,
-                                    // Don't need to update connection count as it hasn't been added
-                                    if (DEBUG)
-                                        Log.d(TAG, "Response failure, Socket Id: " + id);
-                                    disconnectSocket(id, false, false);
-                                }
-                                break;
-                            }
-                            case TERMINATE_ACCESSORY:
-                                Log.d(TAG, "Terminating Server");
+                        if (mPayloadSize == 0) {
+                            // There is no payload, process
+                            if (DEBUG)
+                                Log.i(TAG, "Empty payload");
+                            if (!processPacket(mCurrentCommand, null))
                                 break outerloop;
-                            default:
-                                Log.i(TAG, "Unknown Command received");
+                        } else if (mPayloadSize <= mInputBuffer.remaining()) {
+                            // The buffer contains the entire payload, process
+
+                            // Reset Limit to payload size
+                            int cur_limit = mInputBuffer.limit();
+                            mInputBuffer.limit(mInputBuffer.position() + mPayloadSize);
+                            if (!processPacket(mCurrentCommand, mInputBuffer))
+                                break outerloop;
+
+                            // reset Input buffer limit
+                            mInputBuffer.limit(cur_limit);
+
+                        } else {
+                            // The buffer only contains a partial section of the payload,
+                            // split and store it
+                            storeSplitPayload();
+                            break;
                         }
                     }
-                } else if (bytesRead > 0) {
-                    Log.e(TAG, "Incoming packet too short");
+
+                    if (mInputBuffer.hasRemaining()) {
+                        Log.w(TAG, "Buffer not empty after processing, packet header is split");
+                        Utils.bufferFill(mSplitHeaderBuffer, mInputBuffer);
+                        mHeaderSplit = true;
+                        if (mInputBuffer.hasRemaining()) {
+                            // If the Input buffer has remaining after the fill, Process the
+                            // header and store the remaining bytes in the split payload buffer
+
+                            processSplitHeader();
+                            storeSplitPayload();
+                        }
+                    }
                 }
             }
 
@@ -541,6 +598,79 @@ class AccessoryServer {
                 close();
             }
         }
+
+        private void processSplitHeader() {
+            if (DEBUG)
+                Log.d(TAG, "Processing Split Header");
+            int headerRem = mSplitHeaderBuffer.remaining();
+            if (headerRem > 0) {
+                Utils.bufferFill(mSplitHeaderBuffer, mInputBuffer);
+            }
+
+            mSplitHeaderBuffer.flip();
+            mCurrentCommand = PortCommand.getCommandFromValue(mSplitHeaderBuffer.getShort());
+            mPayloadSize = mSplitHeaderBuffer.getShort() & 0xFFFF;
+            mSplitHeaderBuffer.clear();
+            mHeaderSplit = false;
+        }
+
+        private void storeSplitPayload() {
+            if (DEBUG)
+                Log.d(TAG, "Split Packet Detected");
+            mSplitPayloadBuffer.limit(mPayloadSize);
+            if (mInputBuffer.hasRemaining()) {
+                Utils.bufferFill(mSplitPayloadBuffer, mInputBuffer);
+            }
+            mPayloadSplit = true;
+        }
+
+        private boolean processPacket(PortCommand cmd ,ByteBuffer packetBuffer) {
+            switch (cmd) {
+                case CONNECT_SOCKET:
+                case ACCESSORY_CONNECTED:
+                    Log.i(TAG, "Should not receive command from server: " + cmd);
+                    break;
+                case DISCONNECT_SOCKET: {
+                    Log.i(TAG, "Server disconnected socket");
+                    Short id = packetBuffer.getShort();
+                    disconnectSocket(id, false, true);
+                    break;
+                }
+                case DATA_PACKET: {
+                    Short id = packetBuffer.getShort();
+                    if (!writeToSocket(id, packetBuffer))
+                        disconnectSocket(id, true, true);
+
+                    break;
+                }
+                case CONNECTION_RESP: {
+                    Short id = packetBuffer.getShort();
+                    boolean response = (packetBuffer.getShort() > 0);
+
+                    if (response) {
+                        if (DEBUG)
+                            Log.d(TAG, "Response success, Socket Id: " + id);
+                        mAccessoryCallbacks.onConnectionUpdate(mConnectionCount.get());
+                    } else {
+                        // Socket didn't connect, remove it from the array and close,
+                        // Don't need to update connection count as it hasn't been added
+                        if (DEBUG)
+                            Log.d(TAG, "Response failure, Socket Id: " + id);
+
+                        // This will disconnect the current socket and decrement the connection count
+                        disconnectSocket(id, false, false);
+                    }
+                    break;
+                }
+                case TERMINATE_ACCESSORY:
+                    Log.d(TAG, "Terminating Server");
+                    return false;
+                default:
+                    Log.i(TAG, "Unknown Command received");
+            }
+
+            return true;
+        }
     };
 
     private final Runnable mCloseRunnable = new Runnable() {
@@ -548,6 +678,8 @@ class AccessoryServer {
         @Override
         public void run() {
 
+            if (DEBUG)
+                Log.d(TAG, "Closing Accessory");
             if (mAccessoryConnected.compareAndSet(true, false)) {
                 if (DEBUG)
                     Log.d(TAG, "Sending Termination Command");

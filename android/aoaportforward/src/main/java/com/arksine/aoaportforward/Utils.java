@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 
 /**
  * Static Utility Functions
@@ -99,4 +100,32 @@ public class Utils {
         }
         return new String(hexChars);
     }
+
+    public static void bufferFill(ByteBuffer dest, ByteBuffer source) {
+        int destRem = dest.remaining();
+        if (destRem >= source.remaining()) {
+            dest.put(source);
+        } else {
+            byte[] sourceArray;
+            if (source.hasArray()) {
+                sourceArray = source.array();
+            } else {
+                sourceArray = new byte[destRem];
+                source.get(sourceArray);
+            }
+            int sourceEnd = source.position() + destRem;
+            dest.put(sourceArray, source.position(), destRem);
+            source.position(sourceEnd);
+        }
+    }
+
+    // Like the above, but always reads from source array
+    public static void bufferFill(ByteBuffer dest, ByteBuffer source, byte[] sourceArray) {
+        int transfer = (dest.remaining() < source.remaining())
+                ? dest.remaining() : source.remaining();
+        int sourceEnd = source.position() + transfer;
+        dest.put(sourceArray, source.position(), transfer);
+        source.position(sourceEnd);
+    }
+
 }
